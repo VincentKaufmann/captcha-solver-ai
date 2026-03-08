@@ -35,19 +35,19 @@ CAPTCHA_CLASS_MAP = {
     "taxi": [468],
     "cab": [468],
     "crosswalk": [],
-    "bridge": [839, 840],
+    "bridge": [839],
     "boat": [472, 484, 554, 625, 814, 914],
     "ship": [472, 484, 554, 625, 814, 914],
     "airplane": [404, 405],
     "plane": [404, 405],
-    "train": [466, 547, 705, 820, 829],
+    "train": [466, 547, 820, 829],
     "truck": [555, 569, 656, 675, 717, 864, 867],
-    "fire hydrant": [714],
-    "hydrant": [714],
-    "parking meter": [704],
-    "stair": [900],
-    "mountain": [334, 979, 980],
-    "palm": [818],
+    "fire hydrant": [],
+    "hydrant": [],
+    "parking meter": [705],
+    "stair": [],
+    "mountain": [970, 972, 976, 979, 980],
+    "palm": [],
     "chimney": [],
     "tractor": [866],
 }
@@ -302,9 +302,9 @@ class CaptchaSolver:
         import random
 
         try:
-            # Step 1: Try clicking the checkbox
-            recaptcha_frame = page.frame_locator("iframe[src*='recaptcha']")
-            checkbox = recaptcha_frame.locator(
+            # Step 1: Click the checkbox in the anchor iframe (not bframe)
+            anchor_frame = page.frame_locator("iframe[src*='anchor']")
+            checkbox = anchor_frame.locator(
                 "#recaptcha-anchor, .recaptcha-checkbox-border"
             )
             if await checkbox.count() > 0:
@@ -319,16 +319,20 @@ class CaptchaSolver:
                     await page.mouse.move(x, y, steps=random.randint(10, 25))
                     await page.wait_for_timeout(random.randint(200, 500))
                     await page.mouse.click(x, y)
-                    await page.wait_for_timeout(random.randint(2000, 4000))
+                    await page.wait_for_timeout(random.randint(3000, 5000))
 
-                    # Check if checkbox was enough
-                    still_blocked = await page.locator(
-                        "iframe[src*='recaptcha'][src*='bframe']"
-                    ).count()
-                    if still_blocked == 0:
-                        return True
+                    # Check if checkbox alone was enough (green checkmark)
+                    try:
+                        checked = anchor_frame.locator(
+                            ".recaptcha-checkbox-checked, "
+                            "[aria-checked='true']"
+                        )
+                        if await checked.count() > 0:
+                            return True
+                    except Exception:
+                        pass
 
-            # Step 2: Solve the image challenge
+            # Step 2: Solve the image challenge in the bframe
             challenge_frame = None
             for frame in page.frames:
                 url = frame.url or ""
@@ -351,7 +355,7 @@ class CaptchaSolver:
 
             # Screenshot the grid
             grid = challenge_frame.locator(
-                "table.rc-imageselect-table, .rc-imageselect-target"
+                "table[class*='rc-imageselect-table'], .rc-imageselect-target"
             )
             if await grid.count() == 0:
                 return False
@@ -360,12 +364,13 @@ class CaptchaSolver:
             if not grid_screenshot:
                 return False
 
-            # Detect grid size
-            tiles = challenge_frame.locator(
-                "td.rc-imageselect-tile, .rc-image-tile-wrapper"
-            )
+            # Detect grid size from the table class name (table-33 = 3x3, table-44 = 4x4)
+            is_4x4 = await challenge_frame.locator(".rc-imageselect-table-44").count()
+            grid_size = 4 if is_4x4 > 0 else 3
+
+            # Get only the visible tile cells (td elements in the table)
+            tiles = challenge_frame.locator("table[class*='rc-imageselect-table'] td")
             tile_count = await tiles.count()
-            grid_size = 4 if tile_count == 16 else 3
 
             # Solve it
             result = self.solve_bytes(grid_screenshot, prompt_text, grid_size)
@@ -373,10 +378,10 @@ class CaptchaSolver:
             if not result.matching_cells:
                 return False
 
-            # Click matching cells
+            # Click matching cells with human timing
             for cell_idx in result.matching_cells:
-                tile = tiles.nth(cell_idx)
-                if await tile.count() > 0:
+                if cell_idx < tile_count:
+                    tile = tiles.nth(cell_idx)
                     box = await tile.bounding_box()
                     if box:
                         x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
