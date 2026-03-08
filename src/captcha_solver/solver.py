@@ -288,13 +288,14 @@ class CaptchaSolver:
             raise ValueError("Could not decode image bytes")
         return self.solve(img, prompt, grid_size, confidence_threshold)
 
-    async def solve_on_page(self, page) -> bool:
+    async def solve_on_page(self, page, max_rounds: int = 3) -> bool:
         """Attempt to solve a reCAPTCHA on a live Playwright page.
 
         Requires: pip install captcha-solver-ai[browser]
 
         Args:
             page: A Playwright page object with a visible reCAPTCHA.
+            max_rounds: Maximum number of challenge rounds to attempt.
 
         Returns:
             True if the CAPTCHA was solved, False otherwise.
@@ -332,76 +333,121 @@ class CaptchaSolver:
                     except Exception:
                         pass
 
-            # Step 2: Solve the image challenge in the bframe
-            challenge_frame = None
-            for frame in page.frames:
-                url = frame.url or ""
-                if "recaptcha" in url and "bframe" in url:
-                    challenge_frame = frame
-                    break
+            # Step 2: Solve image challenges (may take multiple rounds)
+            for _round in range(max_rounds):
+                challenge_frame = None
+                for frame in page.frames:
+                    url = frame.url or ""
+                    if "recaptcha" in url and "bframe" in url:
+                        challenge_frame = frame
+                        break
 
-            if not challenge_frame:
-                return False
+                if not challenge_frame:
+                    return False
 
-            # Read the prompt
-            prompt_el = challenge_frame.locator(
-                ".rc-imageselect-desc-no-canonical, .rc-imageselect-desc, "
-                ".rc-imageselect-instructions"
-            )
-            if await prompt_el.count() == 0:
-                return False
+                # Read the prompt
+                prompt_el = challenge_frame.locator(
+                    ".rc-imageselect-desc-no-canonical, .rc-imageselect-desc, "
+                    ".rc-imageselect-instructions"
+                )
+                if await prompt_el.count() == 0:
+                    return False
 
-            prompt_text = await prompt_el.first.inner_text()
+                prompt_text = await prompt_el.first.inner_text()
 
-            # Screenshot the grid
-            grid = challenge_frame.locator(
-                "table[class*='rc-imageselect-table'], .rc-imageselect-target"
-            )
-            if await grid.count() == 0:
-                return False
+                # Screenshot the grid
+                grid = challenge_frame.locator(
+                    "table[class*='rc-imageselect-table'], "
+                    ".rc-imageselect-target"
+                )
+                if await grid.count() == 0:
+                    return False
 
-            grid_screenshot = await grid.first.screenshot()
-            if not grid_screenshot:
-                return False
+                grid_screenshot = await grid.first.screenshot()
+                if not grid_screenshot:
+                    return False
 
-            # Detect grid size from the table class name (table-33 = 3x3, table-44 = 4x4)
-            is_4x4 = await challenge_frame.locator(".rc-imageselect-table-44").count()
-            grid_size = 4 if is_4x4 > 0 else 3
+                # Detect grid size
+                is_4x4 = await challenge_frame.locator(
+                    ".rc-imageselect-table-44"
+                ).count()
+                grid_size = 4 if is_4x4 > 0 else 3
 
-            # Get only the visible tile cells (td elements in the table)
-            tiles = challenge_frame.locator("table[class*='rc-imageselect-table'] td")
-            tile_count = await tiles.count()
+                # Get tile cells
+                tiles = challenge_frame.locator(
+                    "table[class*='rc-imageselect-table'] td"
+                )
+                tile_count = await tiles.count()
 
-            # Solve it
-            result = self.solve_bytes(grid_screenshot, prompt_text, grid_size)
+                # Solve it
+                result = self.solve_bytes(
+                    grid_screenshot, prompt_text, grid_size
+                )
 
-            if not result.matching_cells:
-                return False
+                if not result.matching_cells:
+                    # No matches — click skip if available, otherwise fail
+                    skip_btn = challenge_frame.locator(
+                        "#recaptcha-verify-button"
+                    )
+                    btn_text = ""
+                    if await skip_btn.count() > 0:
+                        btn_text = (
+                            await skip_btn.first.inner_text()
+                        ).strip().lower()
+                    if "skip" in btn_text:
+                        await skip_btn.first.click()
+                        await page.wait_for_timeout(
+                            random.randint(2000, 4000)
+                        )
+                        continue
+                    return False
 
-            # Click matching cells with human timing
-            for cell_idx in result.matching_cells:
-                if cell_idx < tile_count:
-                    tile = tiles.nth(cell_idx)
-                    box = await tile.bounding_box()
-                    if box:
-                        x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-                        y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
-                        await page.mouse.click(x, y)
-                        await page.wait_for_timeout(random.randint(300, 700))
+                # Click matching cells with human timing
+                for cell_idx in result.matching_cells:
+                    if cell_idx < tile_count:
+                        tile = tiles.nth(cell_idx)
+                        box = await tile.bounding_box()
+                        if box:
+                            x = box["x"] + box["width"] * random.uniform(
+                                0.3, 0.7
+                            )
+                            y = box["y"] + box["height"] * random.uniform(
+                                0.3, 0.7
+                            )
+                            await page.mouse.click(x, y)
+                            await page.wait_for_timeout(
+                                random.randint(300, 700)
+                            )
 
-            await page.wait_for_timeout(random.randint(1500, 3000))
+                await page.wait_for_timeout(random.randint(1500, 3000))
 
-            # Click verify
-            verify_btn = challenge_frame.locator("#recaptcha-verify-button")
-            if await verify_btn.count() > 0:
-                await verify_btn.first.click()
-                await page.wait_for_timeout(random.randint(3000, 5000))
+                # Click verify
+                verify_btn = challenge_frame.locator(
+                    "#recaptcha-verify-button"
+                )
+                if await verify_btn.count() > 0:
+                    await verify_btn.first.click()
+                    await page.wait_for_timeout(random.randint(3000, 5000))
 
-            # Check result
-            still_blocked = await page.locator(
-                "iframe[src*='recaptcha'][src*='bframe']"
-            ).count()
-            return still_blocked == 0
+                # Check if solved
+                try:
+                    checked = anchor_frame.locator(
+                        ".recaptcha-checkbox-checked, "
+                        "[aria-checked='true']"
+                    )
+                    if await checked.count() > 0:
+                        return True
+                except Exception:
+                    pass
+
+                # Check if challenge is still showing
+                still_blocked = await page.locator(
+                    "iframe[src*='recaptcha'][src*='bframe']"
+                ).count()
+                if still_blocked == 0:
+                    return True
+
+            return False
 
         except Exception:
             return False
