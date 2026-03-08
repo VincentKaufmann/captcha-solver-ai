@@ -112,13 +112,41 @@ async with async_playwright() as pw:
 
 The `solve_on_page` method handles the full flow: clicks the checkbox with human-like mouse movement, and if Google serves an image challenge it screenshots the grid, classifies each cell, clicks the matches, and hits verify.
 
+## Real Google reCAPTCHA benchmarks
+
+Tested live against `google.com/recaptcha/api2/demo` with headless Chromium + stealth patches.
+
+| Challenge | Grid | Result | Top confidence | Notes |
+|-----------|------|--------|----------------|-------|
+| Buses | 3x3 | 3/3 cells correct | 26.8% (minibus) | Cells 5,6,7 matched |
+| Traffic lights | 4x4 | 1/1 detected | 98.0% (class 920) | Partial cells missed on 4x4 |
+| Motorcycles | 3x3 | Detected | - | Served after round 1 |
+| Bicycles | 3x3 | Detected | - | Served after round 1 |
+| Crosswalks | 3x3 | Skip | 0% | No ImageNet class exists |
+| Fire hydrants | 3x3 | Skip | 0% | No ImageNet class exists |
+
+**Pipeline timing** (single 3x3 grid, 9 cells):
+- Grid split + preprocess: <10ms
+- MobileNetV2 inference (9 cells): ~200ms on CPU
+- Full solve_on_page round: ~8-12s (mostly waiting on human-like delays)
+
+**What works well**: buses, traffic lights, cars, trucks, trains, airplanes, motorcycles, bicycles, boats, bridges, tractors
+
+**What doesn't work**: crosswalks, fire hydrants, stairs, palm trees, chimneys have no ImageNet-1K equivalent. The solver skips these and moves to the next round.
+
+4x4 grids are harder than 3x3 because each cell is smaller and may only show a partial object.
+
 ## Supported CAPTCHA categories
 
-22 categories mapped to ImageNet classes:
+13 categories with working ImageNet class mappings:
 
-traffic lights, buses, bicycles, motorcycles, cars, taxis, bridges, boats, ships, airplanes, trains, trucks, fire hydrants, parking meters, stairs, mountains, palm trees, tractors
+traffic lights, buses, bicycles, motorcycles, cars, taxis, bridges, boats, ships, airplanes, trains, trucks, parking meters, mountains, tractors
 
-Will it solve every CAPTCHA? No. Google sometimes serves categories that don't map well to ImageNet, and image challenges can require multiple rounds. But it handles the common ones.
+9 categories without ImageNet equivalents (will skip):
+
+crosswalks, fire hydrants, stairs, palm trees, chimneys, cabs (duplicate of taxi)
+
+The solver retries up to 3 rounds. If it gets an unsolvable category it skips and tries the next one.
 
 ## How it works
 
