@@ -4,5 +4,9 @@ __pycache__/
 dist/
 build/
 .eggs/
-*.onnx
-test_captcha.png
+training/data/
+training/venv/
+training/*.onnx
+training/*.pth
+*.png
+!README.md

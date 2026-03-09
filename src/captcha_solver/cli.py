@@ -40,11 +40,11 @@ def cmd_solve(args):
     if args.verbose:
         print("\nCell details:")
         for d in result.cell_details:
-            cls_idx, cls_prob = d["top_prediction"]
+            cls_name, cls_prob = d["top_prediction"]
             mark = "*" if d["match"] else " "
             print(
                 f"  [{mark}] Cell {d['index']:2d}: "
-                f"top class={cls_idx} ({cls_prob:.1%}), "
+                f"top={cls_name} ({cls_prob:.1%}), "
                 f"target prob={d['target_max_prob']:.1%}"
             )
 
@@ -64,9 +64,12 @@ def cmd_classify(args):
 
     preds = classify_image(img, session=session, top_k=args.top)
 
+    from captcha_solver.solver import CLASS_NAMES
+
     print(f"Top {args.top} predictions for {args.image}:")
     for idx, prob in preds:
-        print(f"  Class {idx:4d}: {prob:.1%}")
+        name = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else f"class_{idx}"
+        print(f"  {name:20s}: {prob:.1%}")
 
 
 def cmd_download(args):
@@ -111,8 +114,8 @@ def main():
         help="Number of top predictions (default: 5)",
     )
 
-    # download-model
-    sub.add_parser("download-model", help="Pre-download the MobileNetV2 model")
+    # download-model (kept for backwards compat — model is now bundled)
+    sub.add_parser("download-model", help="Check bundled model (model ships with package)")
 
     args = parser.parse_args()
 

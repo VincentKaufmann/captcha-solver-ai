@@ -1,72 +1,122 @@
 """
 Core CAPTCHA solver engine.
 
-Uses MobileNetV2 (ImageNet classifier) to identify objects in CAPTCHA grid cells
-and match them against the challenge prompt.
+Uses a fine-tuned MobileNetV2 (19-class model trained on COCO crops) to identify
+objects in CAPTCHA grid cells and match them against the challenge prompt.
 """
 
 import os
-import urllib.request
 
 import cv2
 import numpy as np
 
-MODEL_DIR = os.path.join(os.path.expanduser("~"), ".captcha_solver")
-MOBILENET_ONNX = os.path.join(MODEL_DIR, "mobilenetv2-12.onnx")
-MODEL_URL = (
-    "https://github.com/onnx/models/raw/main/validated/vision/"
-    "classification/mobilenet/model/mobilenetv2-12.onnx"
-)
+# Bundled model path (ships with the package — only 265KB)
+_BUNDLED_MODEL = os.path.join(os.path.dirname(__file__), "captcha_mobilenet.onnx")
 
-# ImageNet normalization constants
+# Stealth JS to inject before page loads (avoids headless detection)
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer',
+          description: 'Portable Document Format',
+          length: 1, item: () => null, namedItem: () => null,
+          [Symbol.iterator]: function*() { yield {type: 'application/pdf'}; } },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+          description: '', length: 1, item: () => null, namedItem: () => null,
+          [Symbol.iterator]: function*() { yield {type: 'application/pdf'}; } },
+        { name: 'Native Client', filename: 'internal-nacl-plugin',
+          description: '', length: 2, item: () => null, namedItem: () => null,
+          [Symbol.iterator]: function*() { yield {type: 'application/x-nacl'}; yield {type: 'application/x-pnacl'}; } },
+    ],
+});
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+if (!window.chrome) { window.chrome = {}; }
+if (!window.chrome.runtime) {
+    window.chrome.runtime = {
+        connect: function() {},
+        sendMessage: function() {},
+        onMessage: { addListener: function() {} },
+    };
+}
+delete window.__playwright;
+delete window.__pw_manual;
+if (navigator.permissions && navigator.permissions.query) {
+    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (params) => {
+        if (params.name === 'notifications') {
+            return Promise.resolve({ state: 'default', onchange: null });
+        }
+        return origQuery(params);
+    };
+}
+"""
+
+# ImageNet normalization constants (same as training)
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Common reCAPTCHA prompt keywords mapped to ImageNet class indices
-# Reference: https://gist.github.com/yrevar/942d3a0ac09ec9e5eb3a
+# Our 19 custom classes (must match training order exactly)
+CLASS_NAMES = [
+    "background",       # 0
+    "traffic_light",    # 1
+    "bus",              # 2
+    "bicycle",          # 3
+    "motorcycle",       # 4
+    "car",              # 5
+    "bridge",           # 6
+    "boat",             # 7
+    "airplane",         # 8
+    "train",            # 9
+    "truck",            # 10
+    "fire_hydrant",     # 11
+    "parking_meter",    # 12
+    "mountain",         # 13
+    "tractor",          # 14
+    "crosswalk",        # 15
+    "stair",            # 16
+    "palm_tree",        # 17
+    "chimney",          # 18
+]
+
+# Map reCAPTCHA prompt keywords → target class indices in our model
 CAPTCHA_CLASS_MAP = {
-    "traffic light": [920],
-    "bus": [654, 779, 874],
-    "bicycle": [444, 671],
-    "bike": [444, 671],
-    "motorcycle": [670, 665],
-    "motorbike": [670, 665],
-    "car": [436, 468, 511, 609, 656, 717, 751, 817],
-    "taxi": [468],
-    "cab": [468],
-    "crosswalk": [],
-    "bridge": [839],
-    "boat": [472, 484, 554, 625, 814, 914],
-    "ship": [472, 484, 554, 625, 814, 914],
-    "airplane": [404, 405],
-    "plane": [404, 405],
-    "train": [466, 547, 820, 829],
-    "truck": [555, 569, 656, 675, 717, 864, 867],
-    "fire hydrant": [],
-    "hydrant": [],
-    "parking meter": [705],
-    "stair": [],
-    "mountain": [970, 972, 976, 979, 980],
-    "palm": [],
-    "chimney": [],
-    "tractor": [866],
+    "traffic light": [1],
+    "bus": [2],
+    "bicycle": [3],
+    "bike": [3],
+    "motorcycle": [4],
+    "motorbike": [4],
+    "car": [5],
+    "taxi": [5],
+    "cab": [5],
+    "bridge": [6],
+    "boat": [7],
+    "ship": [7],
+    "airplane": [8],
+    "plane": [8],
+    "train": [9],
+    "truck": [10],
+    "fire hydrant": [11],
+    "hydrant": [11],
+    "parking meter": [12],
+    "mountain": [13],
+    "tractor": [14],
+    "crosswalk": [15],
+    "stair": [16],
+    "palm": [17],
+    "chimney": [18],
 }
 
 
 def ensure_model() -> str:
-    """Download MobileNetV2 ONNX if not cached. Returns path to model file."""
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    if os.path.isfile(MOBILENET_ONNX):
-        return MOBILENET_ONNX
-    print(f"Downloading MobileNetV2 ONNX model to {MOBILENET_ONNX} ...")
-    req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "captcha-solver/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = resp.read()
-    with open(MOBILENET_ONNX, "wb") as f:
-        f.write(data)
-    size_mb = len(data) / (1024 * 1024)
-    print(f"Downloaded {size_mb:.1f} MB")
-    return MOBILENET_ONNX
+    """Return path to the bundled ONNX model."""
+    if not os.path.isfile(_BUNDLED_MODEL):
+        raise FileNotFoundError(
+            f"Bundled model not found at {_BUNDLED_MODEL}. "
+            "Please reinstall the package: pip install captcha-solver-ai"
+        )
+    return _BUNDLED_MODEL
 
 
 def _preprocess(img: np.ndarray) -> np.ndarray:
@@ -118,9 +168,9 @@ def split_grid(image: np.ndarray, grid_size: int = 3) -> list[np.ndarray]:
 def classify_image(
     image: np.ndarray,
     session=None,
-    top_k: int = 10,
+    top_k: int = 5,
 ) -> list[tuple[int, float]]:
-    """Classify a single image using MobileNetV2.
+    """Classify a single image using the fine-tuned captcha model.
 
     Args:
         image: Input image as numpy array (BGR).
@@ -147,8 +197,7 @@ def classify_image(
 def classify_cells(
     cells: list[np.ndarray],
     prompt: str,
-    confidence_threshold: float = 0.05,
-    top_k: int = 10,
+    confidence_threshold: float = 0.30,
 ) -> list[dict]:
     """Classify a list of CAPTCHA grid cells against a prompt.
 
@@ -156,10 +205,9 @@ def classify_cells(
         cells: List of cell images (BGR numpy arrays).
         prompt: The CAPTCHA challenge text (e.g. "Select all images with traffic lights").
         confidence_threshold: Minimum probability for a target class to count as a match.
-        top_k: Number of top predictions to check for target class membership.
 
     Returns:
-        List of dicts with keys: index, match (bool), top_prediction (class_index, prob),
+        List of dicts with keys: index, match (bool), top_prediction (class_name, prob),
         target_max_prob (float).
     """
     import onnxruntime as ort
@@ -168,31 +216,41 @@ def classify_cells(
     session = ort.InferenceSession(model_path)
     target_classes = _resolve_target_classes(prompt)
 
+    input_name = session.get_inputs()[0].name
     results = []
+
     for i, cell in enumerate(cells):
-        preds = classify_image(cell, session=session, top_k=top_k)
-        top_indices = {idx for idx, _ in preds}
-
-        # Check if any target class is in top-k
-        match = bool(target_classes & top_indices)
-
-        # Also check raw probability of target classes
-        input_name = session.get_inputs()[0].name
         preprocessed = _preprocess(cell)
         outputs = session.run(None, {input_name: preprocessed})
         probs = _softmax(outputs[0][0])
 
+        top_idx = int(np.argmax(probs))
+        top_prob = float(probs[top_idx])
+        top_name = CLASS_NAMES[top_idx] if top_idx < len(CLASS_NAMES) else "unknown"
+
+        # Get max probability across target class indices
         target_max = 0.0
         if target_classes:
             target_probs = [float(probs[idx]) for idx in target_classes if idx < len(probs)]
             target_max = max(target_probs) if target_probs else 0.0
-            if target_max > confidence_threshold:
-                match = True
+
+        # Smart matching:
+        # - If top prediction IS the target class → always match
+        # - If top is "background" → lower threshold (object partially visible)
+        # - If top is a different known category → higher threshold
+        #   (avoids truck↔bus, motorcycle↔bicycle confusion)
+        match = False
+        if top_idx in target_classes:
+            match = True
+        elif top_name == "background" and target_max >= confidence_threshold * 0.5:
+            match = True
+        elif target_max >= confidence_threshold:
+            match = True
 
         results.append({
             "index": i,
             "match": match,
-            "top_prediction": preds[0] if preds else (0, 0.0),
+            "top_prediction": (top_name, top_prob),
             "target_max_prob": target_max,
         })
 
@@ -231,7 +289,7 @@ class CaptchaSolver:
         grid_image: np.ndarray,
         prompt: str,
         grid_size: int = 3,
-        confidence_threshold: float = 0.05,
+        confidence_threshold: float = 0.30,
     ) -> "SolveResult":
         """Solve a CAPTCHA grid image.
 
@@ -259,7 +317,7 @@ class CaptchaSolver:
         image_path: str,
         prompt: str,
         grid_size: int = 3,
-        confidence_threshold: float = 0.05,
+        confidence_threshold: float = 0.30,
     ) -> "SolveResult":
         """Solve a CAPTCHA from an image file.
 
@@ -279,7 +337,7 @@ class CaptchaSolver:
         image_bytes: bytes,
         prompt: str,
         grid_size: int = 3,
-        confidence_threshold: float = 0.05,
+        confidence_threshold: float = 0.30,
     ) -> "SolveResult":
         """Solve a CAPTCHA from raw image bytes (PNG/JPEG)."""
         arr = np.frombuffer(image_bytes, np.uint8)
@@ -288,7 +346,9 @@ class CaptchaSolver:
             raise ValueError("Could not decode image bytes")
         return self.solve(img, prompt, grid_size, confidence_threshold)
 
-    async def solve_on_page(self, page, max_rounds: int = 3) -> bool:
+    async def solve_on_page(
+        self, page, max_rounds: int = 5, verbose: bool = False,
+    ) -> bool:
         """Attempt to solve a reCAPTCHA on a live Playwright page.
 
         Requires: pip install captcha-solver-ai[browser]
@@ -296,11 +356,16 @@ class CaptchaSolver:
         Args:
             page: A Playwright page object with a visible reCAPTCHA.
             max_rounds: Maximum number of challenge rounds to attempt.
+            verbose: Print debug info during solve.
 
         Returns:
             True if the CAPTCHA was solved, False otherwise.
         """
         import random
+
+        def _log(msg):
+            if verbose:
+                print(f"  [captcha] {msg}")
 
         try:
             # Step 1: Click the checkbox in the anchor iframe (not bframe)
@@ -314,7 +379,8 @@ class CaptchaSolver:
                     x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
                     y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
                     await page.mouse.move(
-                        x - random.randint(50, 150), y - random.randint(50, 150)
+                        x - random.randint(50, 150),
+                        y - random.randint(50, 150),
                     )
                     await page.wait_for_timeout(random.randint(100, 300))
                     await page.mouse.move(x, y, steps=random.randint(10, 25))
@@ -329,12 +395,15 @@ class CaptchaSolver:
                             "[aria-checked='true']"
                         )
                         if await checked.count() > 0:
+                            _log("Solved by checkbox alone")
                             return True
                     except Exception:
                         pass
 
+            _log("Challenge required, entering solve loop")
+
             # Step 2: Solve image challenges (may take multiple rounds)
-            for _round in range(max_rounds):
+            for rnd in range(max_rounds):
                 challenge_frame = None
                 for frame in page.frames:
                     url = frame.url or ""
@@ -343,6 +412,7 @@ class CaptchaSolver:
                         break
 
                 if not challenge_frame:
+                    _log(f"Round {rnd+1}: no challenge frame found")
                     return False
 
                 # Read the prompt
@@ -351,9 +421,13 @@ class CaptchaSolver:
                     ".rc-imageselect-instructions"
                 )
                 if await prompt_el.count() == 0:
+                    _log(f"Round {rnd+1}: no prompt found")
                     return False
 
                 prompt_text = await prompt_el.first.inner_text()
+                _log(
+                    f"Round {rnd+1}: {prompt_text.strip().replace(chr(10), ' ')}"
+                )
 
                 # Screenshot the grid
                 grid = challenge_frame.locator(
@@ -361,10 +435,12 @@ class CaptchaSolver:
                     ".rc-imageselect-target"
                 )
                 if await grid.count() == 0:
+                    _log(f"Round {rnd+1}: no grid found")
                     return False
 
                 grid_screenshot = await grid.first.screenshot()
                 if not grid_screenshot:
+                    _log(f"Round {rnd+1}: screenshot failed")
                     return False
 
                 # Detect grid size
@@ -384,23 +460,59 @@ class CaptchaSolver:
                     grid_screenshot, prompt_text, grid_size
                 )
 
+                _log(
+                    f"Round {rnd+1}: {grid_size}x{grid_size}, "
+                    f"matches={result.matching_cells}"
+                )
+                if verbose:
+                    for d in result.cell_details:
+                        cls_name, cls_prob = d["top_prediction"]
+                        mark = "*" if d["match"] else " "
+                        _log(
+                            f"  [{mark}] Cell {d['index']:2d}: "
+                            f"top={cls_name} ({cls_prob:.1%}), "
+                            f"target={d['target_max_prob']:.1%}"
+                        )
+
                 if not result.matching_cells:
-                    # No matches — click skip if available, otherwise fail
-                    skip_btn = challenge_frame.locator(
+                    # No matches — try skip button first, then reload
+                    # to get a different challenge
+                    verify_btn = challenge_frame.locator(
                         "#recaptcha-verify-button"
                     )
                     btn_text = ""
-                    if await skip_btn.count() > 0:
+                    if await verify_btn.count() > 0:
                         btn_text = (
-                            await skip_btn.first.inner_text()
+                            await verify_btn.first.inner_text()
                         ).strip().lower()
+
                     if "skip" in btn_text:
-                        await skip_btn.first.click()
+                        _log(f"Round {rnd+1}: no matches, clicking skip")
+                        await verify_btn.first.click()
                         await page.wait_for_timeout(
                             random.randint(2000, 4000)
                         )
-                        continue
-                    return False
+                    else:
+                        # 3x3 challenges have no skip — click reload
+                        # to get a different challenge type
+                        reload_btn = challenge_frame.locator(
+                            "#recaptcha-reload-button"
+                        )
+                        if await reload_btn.count() > 0:
+                            _log(
+                                f"Round {rnd+1}: no matches, "
+                                "reloading challenge"
+                            )
+                            await reload_btn.first.click()
+                            await page.wait_for_timeout(
+                                random.randint(2000, 4000)
+                            )
+                        else:
+                            _log(
+                                f"Round {rnd+1}: no matches, "
+                                "no skip/reload found"
+                            )
+                    continue
 
                 # Click matching cells with human timing
                 for cell_idx in result.matching_cells:
@@ -429,6 +541,26 @@ class CaptchaSolver:
                     await verify_btn.first.click()
                     await page.wait_for_timeout(random.randint(3000, 5000))
 
+                # Check for error messages from Google
+                try:
+                    err_more = challenge_frame.locator(
+                        ".rc-imageselect-error-select-more"
+                    )
+                    err_incorrect = challenge_frame.locator(
+                        ".rc-imageselect-incorrect-response"
+                    )
+                    err_dynamic = challenge_frame.locator(
+                        ".rc-imageselect-error-dynamic-more"
+                    )
+                    if await err_more.is_visible():
+                        _log(f"Round {rnd+1}: Google says 'select all matching'")
+                    elif await err_incorrect.is_visible():
+                        _log(f"Round {rnd+1}: Google says 'try again'")
+                    elif await err_dynamic.is_visible():
+                        _log(f"Round {rnd+1}: Google says 'check new images'")
+                except Exception:
+                    pass
+
                 # Check if solved
                 try:
                     checked = anchor_frame.locator(
@@ -436,6 +568,7 @@ class CaptchaSolver:
                         "[aria-checked='true']"
                     )
                     if await checked.count() > 0:
+                        _log("SOLVED!")
                         return True
                 except Exception:
                     pass
@@ -445,11 +578,16 @@ class CaptchaSolver:
                     "iframe[src*='recaptcha'][src*='bframe']"
                 ).count()
                 if still_blocked == 0:
+                    _log("Challenge dismissed — likely solved")
                     return True
 
+                _log(f"Round {rnd+1}: not solved yet, trying next round")
+
+            _log("Max rounds exhausted")
             return False
 
-        except Exception:
+        except Exception as e:
+            _log(f"Exception: {e}")
             return False
 
 

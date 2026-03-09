@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "captcha-solver-ai"
-version = "0.1.2"
-description = "Neural net CAPTCHA solver. MobileNetV2 + OpenCV grid splitting. CLI and Python API. Built for the hell of it."
+version = "0.2.0"
+description = "Neural net CAPTCHA solver. Fine-tuned MobileNetV2 (19-class) + OpenCV grid splitting. CLI and Python API. Built for the hell of it."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
